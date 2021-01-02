@@ -24,14 +24,12 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # You can call use_seed with other seeds or None (for complete randomization)
 # but DO NOT change the default value.
 def use_seed(seed = 1512021):
-    return random.seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.set_deterministic(True)
+    #torch.backends.cudnn.deterministic = True
 
-SEED = use_seed()
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.set_deterministic(True)
-#torch.backends.cudnn.deterministic = True
 
 # utility functions to read the corpus
 def who_am_i(): #this is not a class method
@@ -92,7 +90,7 @@ def get_probabilities_dict(d):
     for key1 in d.keys():
         ctr = d[key1]
         total = sum(ctr.values())
-        prob_dict[key1] = {key2: log(count / total) for key2, count in ctr}
+        prob_dict[key1] = {key2: log(count / total) for key2, count in ctr.items()}
     return prob_dict
 
 
@@ -167,10 +165,10 @@ def baseline_tag_sentence(sentence, perWordTagCounts, allTagCounts):
         if token in perWordTagCounts.keys():
             # get the most frequent tag for this word:
             ctr = perWordTagCounts[token]
-            tag = ctr.most_common(1)[0]
+            tag = ctr.most_common(1)[0][0]
         else:
             # sample from the tag distribution:
-            tag = random.sample(allTagCounts.keys(), k=1, counts=allTagCounts.values())
+            tag = random.choices(list(allTagCounts.keys()), k=1, weights=list(allTagCounts.values()))[0]
         tagged_sentence.append((token, tag))
     return tagged_sentence
 
@@ -193,9 +191,19 @@ def hmm_tag_sentence(sentence, A, B):
         list: list of pairs
     """
 
-    #TODO complete the code
+    end_item = viterbi(sentence, A, B)
+    tags = retrace(end_item)
+    tagged_sentence = list(zip(sentence, tags))
 
     return tagged_sentence
+
+
+class ViterbiCell:
+    def __init__(self, t, r, p):
+        self.tag = t
+        self.ref = r
+        self.prob = p
+
 
 def viterbi(sentence, A, B):
     """Creates the Viterbi matrix, column by column. Each column is a list of
@@ -216,6 +224,7 @@ def viterbi(sentence, A, B):
         obj: the last item, tagged with END. should allow backtraking.
 
         """
+        # TODO - Check the hints:
         # Hint 1: For efficiency reasons - for words seen in training there is no
         #      need to consider all tags in the tagset, but only tags seen with that
         #      word. For OOV you have to consider all tags.
@@ -223,10 +232,39 @@ def viterbi(sentence, A, B):
         #         current list = [ the dummy item ]
         # Hint 3: end the sequence with a dummy: the highest-scoring item with the tag END
 
-
-    #TODO complete the code
+    prev_layer = []
+    # the start log prob is already initialized to 0 (log-prob of 1)
+    v_start = ViterbiCell(t=START, r=None, p=0)
+    prev_layer.append(v_start)
+    # start going over the given sentence:
+    for i, token in enumerate(sentence):
+        curr_layer = []
+        for tag in A.keys():
+            if tag in [START, END]:
+                continue
+            emission_prob = B[tag][token]  # TODO - handle OOV
+            v_curr = get_best_viterbi_cell(tag, emission_prob, prev_layer, A)
+            curr_layer.append(v_curr)
+        prev_layer = curr_layer
+    # TODO - check if need the following code (for the probability of END):
+    v_last = get_best_viterbi_cell(tag=END, emission_prob=0, prev_layer=prev_layer, A=A)
 
     return v_last
+
+
+def get_best_viterbi_cell(tag, emission_prob, prev_layer, A):
+    max_prob, best_prev_tag = None, None
+    for prev_tag in prev_layer:
+        # prev_tag is a ViterbiCell object
+        trans_prob = A[prev_tag.tag][tag]
+        prev_prob = prev_tag.prob
+        curr_prob = emission_prob + trans_prob + prev_prob
+        if max_prob is None or max_prob < curr_prob:
+            max_prob = curr_prob
+            best_prev_tag = prev_tag
+    v_curr = ViterbiCell(t=tag, r=best_prev_tag, p=max_prob)
+    return v_curr
+
 
 #a suggestion for a helper function. Not an API requirement
 def retrace(end_item):
@@ -252,7 +290,16 @@ def joint_prob(sentence, A, B):
     """
     p = 0   # joint log prob. of words and tags
 
-    #TODO complete the code
+    prev_tag = START
+    for word, tag in sentence:
+        # TODO - Check what to do with OOV words and tags
+        trans_p = A[prev_tag][tag]
+        emission_p = B[tag][word]
+        p += trans_p + emission_p  # log probs are added and not multiplied.
+        prev_tag = tag
+    # add the prob to get to end:
+    trans_p = A[prev_tag][END]
+    p += trans_p
 
     assert isfinite(p) and p < 0  # Should be negative. Think why!
     return p
@@ -419,14 +466,15 @@ def tag_sentence(sentence, model):
     Return:
         list: list of pairs
     """
-    if model=='baseline':
+    if list(model.keys())[0] == 'baseline':
         return baseline_tag_sentence(sentence, model.values()[0], model.values()[1])
-    if model=='hmm':
+    if list(model.keys())[0] == 'hmm':
         return hmm_tag_sentence(sentence, model.values()[0], model.values()[1])
-    if model == 'blstm':
+    if list(model.keys())[0] == 'blstm':
         return rnn_tag_sentence(sentence, model.values()[0])
-    if model == 'cblstm':
+    if list(model.keys())[0] == 'cblstm':
         return rnn_tag_sentence(sentence, model.values()[0])
+
 
 def count_correct(gold_sentence, pred_sentence):
     """Return the total number of correctly predicted tags,the total number of
@@ -438,8 +486,21 @@ def count_correct(gold_sentence, pred_sentence):
         pred_sentence (list): list of pairs, tags are predicted by tagger
 
     """
-    assert len(gold_sentence)==len(pred_sentence)
+    global perWordTagCounts
 
-    #TODO complete the code
+    assert len(gold_sentence) == len(pred_sentence)
+    correct, correctOOV, OOV = 0, 0, 0
+    for gold, pred in zip(gold_sentence, pred_sentence):
+        assert gold[0] == pred[0]
+        word = gold[0]
+        if word in perWordTagCounts.keys():
+            # in the vocabulary
+            if gold[1] == pred[1]:
+                correct += 1
+        else:
+            # OOV
+            OOV += 1
+            if gold[1] == pred[1]:
+                correctOOV += 1
 
     return correct, correctOOV, OOV
