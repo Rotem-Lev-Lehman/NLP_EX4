@@ -9,6 +9,8 @@ to predict the part of speech sequence for a given sentence.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
 from torchtext import data
 import torch.optim as optim
 from math import log, isfinite
@@ -53,6 +55,7 @@ def read_annotated_sentence(f):
         sentence.append( (word, tag) )
         line = f.readline()
     return sentence
+
 
 def load_annotated_corpus(filename):
     sentences = []
@@ -272,6 +275,13 @@ def retrace(end_item):
         reversing it and returning the list). The list should correspond to the
         list of words in the sentence (same indices).
     """
+    rev_list = []
+    curr_item = end_item.ref  # skipping the END tag.
+    while curr_item.ref is not None:  # skipping the START tag.
+        rev_list.append(curr_item.tag)
+        curr_item = curr_item.ref
+    return reversed(rev_list)
+
 
 #a suggestion for a helper function. Not an API requirement
 def predict_next_best(word, tag, predecessor_list):
@@ -327,6 +337,54 @@ def joint_prob(sentence, A, B):
 #  5. Think about the way you implement the input representation
 #  6. Consider using different unit types (LSTM, GRU, LeRU)
 
+
+class BiLSTMModel(nn.Module):
+    def __init__(self, input_dimension, embedding_dimension, num_of_layers, output_dimension, vanila=True):
+        super().__init__()
+        self.input_dimension = input_dimension
+        self.embedding_dimension = embedding_dimension
+        self.num_of_layers = num_of_layers
+        self.output_dimension = output_dimension
+        self.vanila = vanila
+
+        # we will initialize the followings with the pretrained embeddings in the train_rnn function:
+        self.word_to_idx = None
+        self.embedding_layer = None
+
+        # if we are using the case-based BiLSTM, we need 3 more inputs:
+        self.features_num = embedding_dimension + 3 * int(not vanila)
+        # TODO - Check if output_dim is the size of the lstm output vectors:
+        self.bi_lstm_layer = nn.LSTM(self.features_num, output_dimension, batch_first=True, bidirectional=True)
+
+        self.hidden_layers = []
+        prev_dim = output_dimension
+        for i in range(num_of_layers):
+            curr_layer = nn.Linear(prev_dim, 256)
+            prev_dim = 256
+            self.hidden_layers.append(curr_layer)
+
+        # the output has the same size as the input, which is the size of the given sentence (input_dimension):
+        self.output_layer = nn.Linear(prev_dim, input_dimension)
+
+    def forward(self, sentence_idx, word_features):
+        embedded = self.embedding(sentence_idx)
+        embedded = embedded.view(len(sentence_idx), self.input_dimension, -1)
+        x = torch.cat((embedded, word_features), dim=1)
+
+        x, _ = self.bi_lstm_layer(x)
+        outputs = []
+        for i in range(self.input_dimension):
+            x_i = x[:, i, :]  # take the features of the i'th word in the sentence, and put it throughout the layers:
+
+            for layer in self.hidden_layers:
+                x_i = layer(x_i)
+                x_i = F.relu(x_i)
+            x_i = self.output_layer(x_i)
+            x_i = np.argmax(x_i)
+            outputs.append(x_i)
+        return outputs
+
+
 def initialize_rnn_model(params_d):
     """Returns an lstm model based on the specified parameters.
 
@@ -344,9 +402,10 @@ def initialize_rnn_model(params_d):
         torch.nn.Module object
     """
 
-    #TODO complete the code
+    model = BiLSTMModel(**params_d)
 
     return model
+
 
 def get_model_params(model):
     """Returns a dictionary specifying the parameters of the specified model.
@@ -363,9 +422,14 @@ def get_model_params(model):
         output_dimension': int}
     """
 
-    #TODO complete the code
+    params_d = {'input_dimension': model.input_dimension,
+                'embedding_dimension': model.embedding_dimension,
+                'num_of_layers': model.num_of_layers,
+                'output_dimension': model.output_dimension,
+                'vanila': model.vanila}
 
     return params_d
+
 
 def load_pretrained_embeddings(path):
     """ Returns an object with the pretrained vectors, loaded from the
@@ -374,8 +438,36 @@ def load_pretrained_embeddings(path):
         The format of the vectors object is not specified as it will be used
         internaly in your code, so you can use the data structure of your choice.
     """
-    #TODO
+    embeddings_dict = {}
+    embedding_dim = None
+    with open(path, mode="r") as file1:
+        all_lines = file1.readlines()
+        for line in all_lines:
+            split_line = line.strip().split()
+            embeddings_dict[split_line[0]] = np.array(split_line[1:]).astype(np.float32)
+            if embedding_dim is None:
+                embedding_dim = len(embeddings_dict[split_line[0]])
+    embeddings_dict[UNK] = np.zeros(embedding_dim)
+
+    vocab = set(embeddings_dict.keys())
+
+    word_to_ix = {}
+    weights = []
+    for i, word in enumerate(vocab):
+        word_to_ix[word] = i
+        weights.append(embeddings_dict[word])
+
+    pretrained_weights = torch.Tensor(weights)
+
+    vectors = {'word_to_idx': word_to_ix,
+               'weights': pretrained_weights}
+
     return vectors
+
+
+def preprocess_data(data_fn, vanila=True):
+    sentences = load_annotated_corpus(data_fn)
+    # TODO - continue this function
 
 
 def train_rnn(model, data_fn, pretrained_embeddings_fn):
@@ -394,13 +486,29 @@ def train_rnn(model, data_fn, pretrained_embeddings_fn):
     # 5. some of the above could be implemented in helper functions (not part of
     #    the required API)
 
-    #TODO complete the code
+    X, y = preprocess_data(data_fn, vanila=model.vanila)
+
+    optimizer = Adam(model.parameters())  # TODO - change lr?
+    epochs = 1  # TODO - change this
+    batch_size = 32  # TODO - check this
 
     criterion = nn.CrossEntropyLoss() #you can set the parameters as you like
     vectors = load_pretrained_embeddings(pretrained_embeddings_fn)
+    model.word_to_idx = vectors['word_to_idx']
+    model.embedding_layer = nn.Embedding.from_pretrained(vectors['weights'])
 
     model = model.to(device)
     criterion = criterion.to(device)
+
+    for epoch in range(epochs):
+        batches = get_batches(X, y, batch_size)
+        for batch_X, batch_y in batches:
+            optimizer.zero_grad()
+
+            y_pred = model(batch_X)
+            loss = criterion(y_pred, batch_y)
+            loss.backward()
+            optimizer.step()
 
 
 def rnn_tag_sentence(sentence, model):
@@ -416,9 +524,10 @@ def rnn_tag_sentence(sentence, model):
         list: list of pairs
     """
 
-    #TODO complete the code
+    X = preprocess_sentence(sentence)
 
     return tagged_sentence
+
 
 def get_best_performing_model_params():
     """Returns a dictionary specifying the parameters of your best performing
