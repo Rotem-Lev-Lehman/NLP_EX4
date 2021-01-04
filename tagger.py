@@ -348,26 +348,28 @@ class BiLSTMModel(nn.Module):
         self.vanila = vanila
 
         # we will initialize the followings with the pretrained embeddings in the train_rnn function:
-        self.word_to_idx = None
+        self.tag2idx = None
+        self.word2idx = None
         self.embedding_layer = None
 
         # if we are using the case-based BiLSTM, we need 3 more inputs:
         self.features_num = embedding_dimension + 3 * int(not vanila)
-        # TODO - Check if output_dim is the size of the lstm output vectors:
-        self.bi_lstm_layer = nn.LSTM(self.features_num, output_dimension, batch_first=True, bidirectional=True)
+        self.lstm_output_dim = 256
+        self.bi_lstm_layer = nn.LSTM(self.features_num, self.lstm_output_dim, batch_first=True, bidirectional=True)
 
+        self.hidden_output_dim = 256
         self.hidden_layers = []
-        prev_dim = output_dimension
+        prev_dim = self.lstm_output_dim
         for i in range(num_of_layers):
-            curr_layer = nn.Linear(prev_dim, 256)
-            prev_dim = 256
+            curr_layer = nn.Linear(prev_dim, self.hidden_output_dim)
+            prev_dim = self.hidden_output_dim
             self.hidden_layers.append(curr_layer)
 
         # the output has the same size as the input, which is the size of the given sentence (input_dimension):
-        self.output_layer = nn.Linear(prev_dim, input_dimension)
+        self.output_layer = nn.Linear(prev_dim, output_dimension)
 
     def forward(self, sentence_idx, word_features):
-        embedded = self.embedding(sentence_idx)
+        embedded = self.embedding_layer(sentence_idx)
         embedded = embedded.view(len(sentence_idx), self.input_dimension, -1)
         x = torch.cat((embedded, word_features), dim=1)
 
@@ -431,6 +433,25 @@ def get_model_params(model):
     return params_d
 
 
+# end of sentence:
+EOS_WORD = '<DUMMY_EOS>'
+EOS_TAG = END
+
+
+def save_embedding_pickle(path):
+    import pickle
+    vectors = load_pretrained_embeddings(path)
+    with open('vectors.pickle', 'wb') as f:
+        pickle.dump(vectors, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_embeddings_pickle():
+    import pickle
+    with open('vectors.pickle', 'rb') as f:
+        vectors = pickle.load(f)
+    return vectors
+
+
 def load_pretrained_embeddings(path):
     """ Returns an object with the pretrained vectors, loaded from the
         file at the specified path. The file format is the same as
@@ -440,34 +461,105 @@ def load_pretrained_embeddings(path):
     """
     embeddings_dict = {}
     embedding_dim = None
-    with open(path, mode="r") as file1:
+    with open(path, mode="r", encoding='UTF-8') as file1:
         all_lines = file1.readlines()
         for line in all_lines:
             split_line = line.strip().split()
             embeddings_dict[split_line[0]] = np.array(split_line[1:]).astype(np.float32)
             if embedding_dim is None:
                 embedding_dim = len(embeddings_dict[split_line[0]])
+
+    print('Done embeddings')
+    # add special words:
     embeddings_dict[UNK] = np.zeros(embedding_dim)
+    embeddings_dict[EOS_WORD] = np.zeros(embedding_dim)
 
     vocab = set(embeddings_dict.keys())
 
-    word_to_ix = {}
+    word2idx = {}
     weights = []
     for i, word in enumerate(vocab):
-        word_to_ix[word] = i
+        word2idx[word] = i
         weights.append(embeddings_dict[word])
 
     pretrained_weights = torch.Tensor(weights)
 
-    vectors = {'word_to_idx': word_to_ix,
+    vectors = {'word2idx': word2idx,
                'weights': pretrained_weights}
 
     return vectors
 
 
-def preprocess_data(data_fn, vanila=True):
+def preprocess_word(word, word2idx, vanila=True):
+    if vanila:
+        case_features = []
+    else:
+        case_features = [word.islower(), word.isupper(), word[0].isupper()]
+    idx = word2idx[word] if word in word2idx.keys() else word2idx[UNK]
+    return idx, case_features
+
+
+def preprocess_sentence(sentence, word2idx, vanila=True):
+    idx_sentence = []
+    case_sentence = []
+    for word in sentence:
+        idx, case = preprocess_word(word, word2idx, vanila)
+        idx_sentence.append(idx)
+        case_sentence.append(case)
+
+    return idx_sentence, case_sentence
+
+
+def preprocess_data(data_fn, word2idx, sentence_length, vanila=True):
     sentences = load_annotated_corpus(data_fn)
-    # TODO - continue this function
+    tag2idx = {EOS_TAG: 0}
+    next_tag_index = 1
+
+    X_idx_sentences = []
+    X_case_sentences = []
+    y_sentences = []
+    print('preprocessing data')
+    for sentence in sentences:
+        words = []
+        tags = []
+        for word, tag in sentence:
+            words.append(word)
+
+            if tag not in tag2idx.keys():
+                tag2idx[tag] = next_tag_index
+                next_tag_index += 1
+            idx = tag2idx[tag]
+
+            tags.append(idx)
+        # pad the sentence:
+        diff = sentence_length - len(sentence)
+        if diff <= 0:
+            raise Exception(f'Need to increase the input_dim by at least {-diff + 1}')
+        words += diff * [EOS_WORD]
+        tags += diff * [tag2idx[EOS_TAG]]
+
+        X_idx_sentence, X_case_sentence = preprocess_sentence(words, word2idx, vanila)
+
+        X_idx_sentences.append(X_idx_sentence)
+        X_case_sentences.append(X_case_sentence)
+        y_sentences.append(tags)
+    print('done preprocess')
+    X_idx = torch.LongTensor(X_idx_sentences)
+    X_case = torch.BoolTensor(X_case_sentences)
+    y = torch.LongTensor(y_sentences)
+    return X_idx, X_case, y, tag2idx
+
+
+def get_batches(X_idx, X_case, y, batch_size):
+    idx_list = np.arange(len(X_idx))
+    np.random.shuffle(idx_list)
+    i = 0
+    while i * batch_size < len(idx_list):
+        batch_X_idx = X_idx[i * batch_size:(i + 1) * batch_size]
+        batch_X_case = X_case[i * batch_size:(i + 1) * batch_size]
+        batch_y = y[i * batch_size:(i + 1) * batch_size]
+        yield batch_X_idx, batch_X_case, batch_y
+        i += 1
 
 
 def train_rnn(model, data_fn, pretrained_embeddings_fn):
@@ -486,26 +578,31 @@ def train_rnn(model, data_fn, pretrained_embeddings_fn):
     # 5. some of the above could be implemented in helper functions (not part of
     #    the required API)
 
-    X, y = preprocess_data(data_fn, vanila=model.vanila)
+    criterion = nn.CrossEntropyLoss()  # you can set the parameters as you like
+    # vectors = load_pretrained_embeddings(pretrained_embeddings_fn)
+    vectors = load_embeddings_pickle()
+    model.word2idx = vectors['word2idx']
+    model.embedding_layer = nn.Embedding.from_pretrained(vectors['weights'])
+
+    X_idx, X_case, y, tag2idx = preprocess_data(data_fn, word2idx=model.word2idx, sentence_length=model.input_dimension, vanila=model.vanila)
+    model.tag2idx = tag2idx
 
     optimizer = Adam(model.parameters())  # TODO - change lr?
     epochs = 1  # TODO - change this
     batch_size = 32  # TODO - check this
 
-    criterion = nn.CrossEntropyLoss() #you can set the parameters as you like
-    vectors = load_pretrained_embeddings(pretrained_embeddings_fn)
-    model.word_to_idx = vectors['word_to_idx']
-    model.embedding_layer = nn.Embedding.from_pretrained(vectors['weights'])
-
     model = model.to(device)
     criterion = criterion.to(device)
 
     for epoch in range(epochs):
-        batches = get_batches(X, y, batch_size)
-        for batch_X, batch_y in batches:
+        for batch_X_idx, batch_X_case, batch_y in get_batches(X_idx, X_case, y, batch_size):
+            batch_X_idx = batch_X_idx.to(device)
+            batch_X_case = batch_X_case.to(device)
+            batch_y = batch_y.to(device)
+
             optimizer.zero_grad()
 
-            y_pred = model(batch_X)
+            y_pred = model(batch_X_idx, batch_X_case)
             loss = criterion(y_pred, batch_y)
             loss.backward()
             optimizer.step()
@@ -523,8 +620,7 @@ def rnn_tag_sentence(sentence, model):
     Return:
         list: list of pairs
     """
-
-    X = preprocess_sentence(sentence)
+    X = preprocess_sentence(sentence, vanila=model.vanila)
 
     return tagged_sentence
 
