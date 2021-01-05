@@ -349,42 +349,37 @@ class BiLSTMModel(nn.Module):
 
         # we will initialize the followings with the pretrained embeddings in the train_rnn function:
         self.tag2idx = None
+        self.idx2tag = None
         self.word2idx = None
         self.embedding_layer = None
 
         # if we are using the case-based BiLSTM, we need 3 more inputs:
         self.features_num = embedding_dimension + 3 * int(not vanila)
         self.lstm_output_dim = 256
-        self.bi_lstm_layer = nn.LSTM(self.features_num, self.lstm_output_dim, batch_first=True, bidirectional=True)
+        self.dropout_percentage = 0.25 if num_of_layers > 1 else 0
+        self.bi_lstm_layer = nn.LSTM(self.features_num,
+                                     self.lstm_output_dim,
+                                     num_layers=num_of_layers,
+                                     dropout=self.dropout_percentage,
+                                     batch_first=True, bidirectional=True)
 
-        self.hidden_output_dim = 256
-        self.hidden_layers = []
-        prev_dim = self.lstm_output_dim
-        for i in range(num_of_layers):
-            curr_layer = nn.Linear(prev_dim, self.hidden_output_dim)
-            prev_dim = self.hidden_output_dim
-            self.hidden_layers.append(curr_layer)
-
-        # the output has the same size as the input, which is the size of the given sentence (input_dimension):
-        self.output_layer = nn.Linear(prev_dim, output_dimension)
+        self.output_layer = nn.Linear(self.lstm_output_dim * 2, output_dimension)
+        self.dropout_layer = nn.Dropout(0.25)
 
     def forward(self, sentence_idx, word_features):
-        embedded = self.embedding_layer(sentence_idx)
-        embedded = embedded.view(len(sentence_idx), self.input_dimension, -1)
-        x = torch.cat((embedded, word_features), dim=1)
+        embedded = self.dropout_layer(self.embedding_layer(sentence_idx))
+
+        if self.vanila:
+            x = embedded
+        else:
+            x = torch.cat((embedded, word_features), dim=1)
 
         x, _ = self.bi_lstm_layer(x)
-        outputs = []
-        for i in range(self.input_dimension):
-            x_i = x[:, i, :]  # take the features of the i'th word in the sentence, and put it throughout the layers:
 
-            for layer in self.hidden_layers:
-                x_i = layer(x_i)
-                x_i = F.relu(x_i)
-            x_i = self.output_layer(x_i)
-            x_i = np.argmax(x_i)
-            outputs.append(x_i)
-        return outputs
+        x = self.dropout_layer(x)
+        x = self.output_layer(x)
+
+        return x
 
 
 def initialize_rnn_model(params_d):
@@ -536,6 +531,7 @@ def preprocess_data(data_fn, word2idx, sentence_length, vanila=True):
         if diff <= 0:
             raise Exception(f'Need to increase the input_dim by at least {-diff + 1}')
         words += diff * [EOS_WORD]
+
         tags += diff * [tag2idx[EOS_TAG]]
 
         X_idx_sentence, X_case_sentence = preprocess_sentence(words, word2idx, vanila)
@@ -547,7 +543,10 @@ def preprocess_data(data_fn, word2idx, sentence_length, vanila=True):
     X_idx = torch.LongTensor(X_idx_sentences)
     X_case = torch.BoolTensor(X_case_sentences)
     y = torch.LongTensor(y_sentences)
-    return X_idx, X_case, y, tag2idx
+
+    idx2tag = {val: key for key, val in tag2idx.items()}
+
+    return X_idx, X_case, y, tag2idx, idx2tag
 
 
 def get_batches(X_idx, X_case, y, batch_size):
@@ -555,9 +554,11 @@ def get_batches(X_idx, X_case, y, batch_size):
     np.random.shuffle(idx_list)
     i = 0
     while i * batch_size < len(idx_list):
-        batch_X_idx = X_idx[i * batch_size:(i + 1) * batch_size]
-        batch_X_case = X_case[i * batch_size:(i + 1) * batch_size]
-        batch_y = y[i * batch_size:(i + 1) * batch_size]
+        indices = idx_list[i * batch_size:(i + 1) * batch_size]
+
+        batch_X_idx = X_idx[indices]
+        batch_X_case = X_case[indices]
+        batch_y = y[indices]
         yield batch_X_idx, batch_X_case, batch_y
         i += 1
 
@@ -584,18 +585,21 @@ def train_rnn(model, data_fn, pretrained_embeddings_fn):
     model.word2idx = vectors['word2idx']
     model.embedding_layer = nn.Embedding.from_pretrained(vectors['weights'])
 
-    X_idx, X_case, y, tag2idx = preprocess_data(data_fn, word2idx=model.word2idx, sentence_length=model.input_dimension, vanila=model.vanila)
+    X_idx, X_case, y, tag2idx, idx2tag = preprocess_data(data_fn, word2idx=model.word2idx, sentence_length=model.input_dimension, vanila=model.vanila)
     model.tag2idx = tag2idx
+    model.idx2tag = idx2tag
 
     optimizer = Adam(model.parameters())  # TODO - change lr?
-    epochs = 1  # TODO - change this
-    batch_size = 32  # TODO - check this
+    epochs = 100  # TODO - change this
+    batch_size = 128  # TODO - check this
 
     model = model.to(device)
     criterion = criterion.to(device)
 
     for epoch in range(epochs):
-        for batch_X_idx, batch_X_case, batch_y in get_batches(X_idx, X_case, y, batch_size):
+        print(f'Epoch num {epoch}')
+        for i, (batch_X_idx, batch_X_case, batch_y) in enumerate(get_batches(X_idx, X_case, y, batch_size)):
+            print(f'Batch number {i}')
             batch_X_idx = batch_X_idx.to(device)
             batch_X_case = batch_X_case.to(device)
             batch_y = batch_y.to(device)
@@ -603,6 +607,9 @@ def train_rnn(model, data_fn, pretrained_embeddings_fn):
             optimizer.zero_grad()
 
             y_pred = model(batch_X_idx, batch_X_case)
+            y_pred = y_pred.reshape(-1, y_pred.shape[-1])
+            batch_y = batch_y.reshape(-1)
+
             loss = criterion(y_pred, batch_y)
             loss.backward()
             optimizer.step()
@@ -620,7 +627,22 @@ def rnn_tag_sentence(sentence, model):
     Return:
         list: list of pairs
     """
-    X = preprocess_sentence(sentence, vanila=model.vanila)
+    # pad the sentence:
+    sentence_length = model.input_dimension
+    diff = sentence_length - len(sentence)
+    if diff <= 0:
+        raise Exception(f'Need to increase the input_dim by at least {-diff + 1}')
+    words = sentence + diff * [EOS_WORD]
+    X_idx, X_case = preprocess_sentence(words, word2idx=model.word2idx, vanila=model.vanila)
+    X_idx_tensor = torch.LongTensor(X_idx).reshape(1, sentence_length).to(device)
+    X_case_tensor = torch.BoolTensor(X_idx).reshape(1, sentence_length).to(device)
+
+    predictions = model(X_idx_tensor, X_case_tensor)
+    tags_idx = torch.argmax(predictions, dim=-1).reshape(-1)
+    tags = [model.idx2tag[int(idx)] if int(idx) in model.idx2tag.keys() else UNK for idx in tags_idx]
+    tags = tags[:len(sentence)]
+
+    tagged_sentence = list(zip(sentence, tags))
 
     return tagged_sentence
 
