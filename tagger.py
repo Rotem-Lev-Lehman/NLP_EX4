@@ -100,7 +100,15 @@ def get_probabilities_dict(d):
 def smooth_dictionary(d, smooth_options):
     for key1 in d.keys():
         ctr = d[key1]
-        for key2 in smooth_options:
+        '''
+        if key1 == START:
+            # special case - we don't allow a transition from the START immediately to the END
+            curr_smooth_options = smooth_options - {END}
+        else:
+            curr_smooth_options = smooth_options
+        '''
+        curr_smooth_options = smooth_options  # TODO - this is for not using the END transition prob.
+        for key2 in curr_smooth_options:
             ctr[key2] += 1
 
 
@@ -112,18 +120,17 @@ def learn_params(tagged_sentences):
     The transisionCounts and emmisionCounts
     should be computed with pseudo tags and should be smoothed.
     A and B should be the log-probability of the normalized counts, based on
-    transisionCounts and  emmisionCounts
+    transisionCounts and emmisionCounts
 
     Args:
     tagged_sentences: a list of tagged sentences, each tagged sentence is a
-     list of pairs (w,t), as retunred by load_annotated_corpus().
+     list of pairs (w,t), as returned by load_annotated_corpus().
 
     Return:
     [allTagCounts,perWordTagCounts,transitionCounts,emissionCounts,A,B] (a list)
     """
     global perWordTagCounts, allTagCounts, transitionCounts, emissionCounts, A, B
 
-    # TODO - check what to do with the UNK (unknown) tag
     perWordTagCounts = {}
     allTagCounts = Counter()
     transitionCounts = {}
@@ -139,8 +146,10 @@ def learn_params(tagged_sentences):
             prev_tag = tag
         insert2dict_of_counters(transitionCounts, prev_tag, END)
 
-    smooth_dictionary(transitionCounts, set(allTagCounts.keys()) | {END})
-    smooth_dictionary(emissionCounts, perWordTagCounts.keys())
+    # TODO - check the smoothing of END, by the answer in the course's forum:
+    # smooth_dictionary(transitionCounts, set(allTagCounts.keys()) | {END})
+    smooth_dictionary(transitionCounts, set(allTagCounts.keys()))  # TODO - this is for not using the END transition prob.
+    smooth_dictionary(emissionCounts, set(perWordTagCounts.keys()) | {UNK})
 
     A = get_probabilities_dict(transitionCounts)
     B = get_probabilities_dict(emissionCounts)
@@ -226,14 +235,14 @@ def viterbi(sentence, A, B):
     Return:
         obj: the last item, tagged with END. should allow backtraking.
 
-        """
-        # TODO - Check the hints:
-        # Hint 1: For efficiency reasons - for words seen in training there is no
-        #      need to consider all tags in the tagset, but only tags seen with that
-        #      word. For OOV you have to consider all tags.
-        # Hint 2: start with a dummy item with the START tag (what would it log-prob be?).
-        #         current list = [ the dummy item ]
-        # Hint 3: end the sequence with a dummy: the highest-scoring item with the tag END
+    """
+    # TODO - Check the hints:
+    # Hint 1: For efficiency reasons - for words seen in training there is no
+    #      need to consider all tags in the tagset, but only tags seen with that
+    #      word. For OOV you have to consider all tags.
+    # Hint 2: start with a dummy item with the START tag (what would it log-prob be?).
+    #         current list = [ the dummy item ]
+    # Hint 3: end the sequence with a dummy: the highest-scoring item with the tag END
 
     prev_layer = []
     # the start log prob is already initialized to 0 (log-prob of 1)
@@ -245,11 +254,13 @@ def viterbi(sentence, A, B):
         for tag in A.keys():
             if tag in [START, END]:
                 continue
-            emission_prob = B[tag][token]  # TODO - handle OOV
+            if token not in B[tag].keys():
+                token = UNK
+            emission_prob = B[tag][token]
             v_curr = get_best_viterbi_cell(tag, emission_prob, prev_layer, A)
             curr_layer.append(v_curr)
         prev_layer = curr_layer
-    # TODO - check if need the following code (for the probability of END):
+    # TODO - check if need the following code (for the probability of END) - check in the forum:
     v_last = get_best_viterbi_cell(tag=END, emission_prob=0, prev_layer=prev_layer, A=A)
 
     return v_last
@@ -259,7 +270,10 @@ def get_best_viterbi_cell(tag, emission_prob, prev_layer, A):
     max_prob, best_prev_tag = None, None
     for prev_tag in prev_layer:
         # prev_tag is a ViterbiCell object
-        trans_prob = A[prev_tag.tag][tag]
+        if tag == END:  # TODO - this is for not using the END transition prob.
+            trans_prob = 0
+        else:
+            trans_prob = A[prev_tag.tag][tag]
         prev_prob = prev_tag.prob
         curr_prob = emission_prob + trans_prob + prev_prob
         if max_prob is None or max_prob < curr_prob:
@@ -304,10 +318,13 @@ def joint_prob(sentence, A, B):
     for word, tag in sentence:
         # TODO - Check what to do with OOV words and tags
         trans_p = A[prev_tag][tag]
+        if word not in B[tag].keys():
+            word = UNK
         emission_p = B[tag][word]
         p += trans_p + emission_p  # log probs are added and not multiplied.
         prev_tag = tag
     # add the prob to get to end:
+    # TODO - check the forum to see if we need the the following probability:
     trans_p = A[prev_tag][END]
     p += trans_p
 
@@ -372,7 +389,7 @@ class BiLSTMModel(nn.Module):
         if self.vanila:
             x = embedded
         else:
-            x = torch.cat((embedded, word_features), dim=1)
+            x = torch.cat((embedded, word_features), dim=2)
 
         x, _ = self.bi_lstm_layer(x)
 
@@ -460,14 +477,16 @@ def load_pretrained_embeddings(path):
         all_lines = file1.readlines()
         for line in all_lines:
             split_line = line.strip().split()
-            embeddings_dict[split_line[0]] = np.array(split_line[1:]).astype(np.float32)
+            word = split_line[0].lower()
+            embeddings_dict[word] = np.array(split_line[1:]).astype(np.float32)
             if embedding_dim is None:
-                embedding_dim = len(embeddings_dict[split_line[0]])
+                embedding_dim = len(embeddings_dict[word])
 
     print('Done embeddings')
     # add special words:
-    embeddings_dict[UNK] = np.zeros(embedding_dim)
-    embeddings_dict[EOS_WORD] = np.zeros(embedding_dim)
+    # embeddings_dict[UNK] = np.zeros(embedding_dim)
+    # embeddings_dict[EOS_WORD] = np.zeros(embedding_dim)
+    # TODO - maybe use the Padding index in the embedding layer of the model.
 
     vocab = set(embeddings_dict.keys())
 
@@ -477,10 +496,12 @@ def load_pretrained_embeddings(path):
         word2idx[word] = i
         weights.append(embeddings_dict[word])
 
-    pretrained_weights = torch.Tensor(weights)
+    # add special words:
+    add_word_to_embeddings(word2idx, weights, UNK)
+    add_word_to_embeddings(word2idx, weights, EOS_WORD)
 
     vectors = {'word2idx': word2idx,
-               'weights': pretrained_weights}
+               'weights': weights}
 
     return vectors
 
@@ -490,7 +511,11 @@ def preprocess_word(word, word2idx, vanila=True):
         case_features = []
     else:
         case_features = [word.islower(), word.isupper(), word[0].isupper()]
-    idx = word2idx[word] if word in word2idx.keys() else word2idx[UNK]
+    if word == EOS_WORD:  # special case - the EOS_WORD will be indexed with upper-case and not lower-case
+        idx = word2idx[word]
+    else:
+        lowered_word = word.lower()
+        idx = word2idx[lowered_word] if lowered_word in word2idx.keys() else word2idx[UNK]
     return idx, case_features
 
 
@@ -505,8 +530,19 @@ def preprocess_sentence(sentence, word2idx, vanila=True):
     return idx_sentence, case_sentence
 
 
-def preprocess_data(data_fn, word2idx, sentence_length, vanila=True):
+def add_word_to_embeddings(word2idx, weights, word):
+    idx = len(word2idx.keys())
+    embedding_dim = len(weights[0])
+    word2idx[word] = idx
+    weight = np.random.randn(embedding_dim)  # random nd array, with values from the standard normal distribution
+    weights.append(weight)
+
+
+def preprocess_data(data_fn, vectors, sentence_length, vanila=True):
     sentences = load_annotated_corpus(data_fn)
+    word2idx = vectors['word2idx']
+    weights = vectors['weights']
+
     tag2idx = {EOS_TAG: 0}
     next_tag_index = 1
 
@@ -518,6 +554,9 @@ def preprocess_data(data_fn, word2idx, sentence_length, vanila=True):
         words = []
         tags = []
         for word, tag in sentence:
+            if word.lower() not in word2idx.keys():
+                add_word_to_embeddings(word2idx, weights, word.lower())
+
             words.append(word)
 
             if tag not in tag2idx.keys():
@@ -563,13 +602,15 @@ def get_batches(X_idx, X_case, y, batch_size):
         i += 1
 
 
-def train_rnn(model, data_fn, pretrained_embeddings_fn):
+def train_rnn(model, data_fn, pretrained_embeddings_fn, input_rep=0):
     """Trains the BiLSTM model on the specified data.
 
     Args:
         model (torch.nn.Module): the model to train
         data_fn (string): full path to the file with training data (in the provided format)
         pretrained_embeddings_fn (string): full path to the file with pretrained embeddings
+        input_rep (int): sets the input representation. Defaults to 0 (vanilla),
+                         1: case-base; <other int>: other models, if you are playful
     """
     #Tips:
     # 1. you have to specify an optimizer
@@ -579,27 +620,32 @@ def train_rnn(model, data_fn, pretrained_embeddings_fn):
     # 5. some of the above could be implemented in helper functions (not part of
     #    the required API)
 
+    # TODO - check the forum for answers about the input_rep parameter, and use it accordingly
     criterion = nn.CrossEntropyLoss()  # you can set the parameters as you like
     # vectors = load_pretrained_embeddings(pretrained_embeddings_fn)
+    # TODO - before submitting, change the vectors initialization to not use the pickle file...
     vectors = load_embeddings_pickle()
     model.word2idx = vectors['word2idx']
-    model.embedding_layer = nn.Embedding.from_pretrained(vectors['weights'])
 
-    X_idx, X_case, y, tag2idx, idx2tag = preprocess_data(data_fn, word2idx=model.word2idx, sentence_length=model.input_dimension, vanila=model.vanila)
+    X_idx, X_case, y, tag2idx, idx2tag = preprocess_data(data_fn, vectors=vectors, sentence_length=model.input_dimension, vanila=model.vanila)
     model.tag2idx = tag2idx
     model.idx2tag = idx2tag
 
+    pretrained_weights = torch.Tensor(vectors['weights'])
+    model.embedding_layer = nn.Embedding.from_pretrained(pretrained_weights)
+
     optimizer = Adam(model.parameters())  # TODO - change lr?
-    epochs = 100  # TODO - change this
-    batch_size = 128  # TODO - check this
+    epochs = 1  # TODO - change this
+    batch_size = 128
 
     model = model.to(device)
     criterion = criterion.to(device)
 
-    for epoch in range(epochs):
-        print(f'Epoch num {epoch}')
-        for i, (batch_X_idx, batch_X_case, batch_y) in enumerate(get_batches(X_idx, X_case, y, batch_size)):
-            print(f'Batch number {i}')
+    from tqdm import tqdm
+    # TODO - before we submit, remove all printing, including the tqdm
+
+    for epoch in tqdm(range(epochs)):
+        for batch_X_idx, batch_X_case, batch_y in get_batches(X_idx, X_case, y, batch_size):
             batch_X_idx = batch_X_idx.to(device)
             batch_X_case = batch_X_case.to(device)
             batch_y = batch_y.to(device)
@@ -613,9 +659,10 @@ def train_rnn(model, data_fn, pretrained_embeddings_fn):
             loss = criterion(y_pred, batch_y)
             loss.backward()
             optimizer.step()
+            break
 
 
-def rnn_tag_sentence(sentence, model):
+def rnn_tag_sentence(sentence, model, input_rep=0):
     """ Returns a list of pairs (w,t) where each w corresponds to a word
         (same index) in the input sentence. Tagging is done with the Viterby
         algorithm.
@@ -623,6 +670,8 @@ def rnn_tag_sentence(sentence, model):
     Args:
         sentence (list): a list of tokens (the sentence to tag)
         model (torch.nn.Module):  a trained BiLSTM model
+        input_rep (int): sets the input representation. Defaults to 0 (vanilla),
+                         1: case-base; <other int>: other models, if you are playful
 
     Return:
         list: list of pairs
@@ -635,7 +684,7 @@ def rnn_tag_sentence(sentence, model):
     words = sentence + diff * [EOS_WORD]
     X_idx, X_case = preprocess_sentence(words, word2idx=model.word2idx, vanila=model.vanila)
     X_idx_tensor = torch.LongTensor(X_idx).reshape(1, sentence_length).to(device)
-    X_case_tensor = torch.BoolTensor(X_idx).reshape(1, sentence_length).to(device)
+    X_case_tensor = torch.BoolTensor(X_case).reshape(1, sentence_length, -1).to(device)
 
     predictions = model(X_idx_tensor, X_case_tensor)
     tags_idx = torch.argmax(predictions, dim=-1).reshape(-1)
@@ -729,5 +778,6 @@ def count_correct(gold_sentence, pred_sentence):
             OOV += 1
             if gold[1] == pred[1]:
                 correctOOV += 1
+                correct += 1
 
     return correct, correctOOV, OOV

@@ -8,6 +8,22 @@ dev_data = tagger.load_annotated_corpus(dev_path)
 
 [allTagCounts, perWordTagCounts, transitionCounts, emissionCounts, A, B] = tagger.learn_params(train_data)
 
+algs = ['baseline', 'hmm']
+for alg in algs:
+    score_nom, score_denom = 0, 0
+    for gold_sentence in dev_data:
+        pred_sentence = [w[0] for w in gold_sentence]
+        if alg == 'baseline':
+            tagged_sentence = tagger.baseline_tag_sentence(pred_sentence, perWordTagCounts, allTagCounts)
+        else:
+            tagged_sentence = tagger.hmm_tag_sentence(pred_sentence, A, B)
+        correct, correctOOV, OOV = tagger.count_correct(gold_sentence, tagged_sentence)
+        score_nom += correct
+        score_denom += len(pred_sentence)
+
+    print(f"{alg} score is {score_nom/score_denom}")
+
+'''
 total_correct, total_correctOOV, total_OOV, total_length = 0, 0, 0, 0
 #for gold_sentence in dev_data:
 gold_sentence = train_data[0]
@@ -29,3 +45,4 @@ print(prob1)
 print(tagged_sentence)
 print(prob2)
 print(f"correct: {total_correct}, non_OOV: {total_length}, correctOOV: {total_correctOOV}, OOV: {total_OOV}")
+'''

@@ -7,7 +7,8 @@ embedding_path = 'glove.6B.100d.txt'
 params = {'input_dimension': 200,
           'embedding_dimension': 100,
           'num_of_layers': 1,
-          'output_dimension': 45}
+          'output_dimension': 45,
+          'vanila': False}
 
 # tagger.save_embedding_pickle(embedding_path)
 
